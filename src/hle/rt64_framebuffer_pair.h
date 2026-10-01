@@ -54,6 +54,10 @@ namespace RT64 {
         FixedRect drawDepthRect;
         FlushReason flushReason;
 
+        // [wcw fix] Counts resets (deliberately not cleared by reset()), so a stored reference can tell
+        // that this pair slot was reused.
+        uint64_t resetGeneration = 0;
+
         void reset();
         void addGameCall(const GameCall &gameCall);
         bool inProjection(uint32_t transformsIndex, Projection::Type type) const;

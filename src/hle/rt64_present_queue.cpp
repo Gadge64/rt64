@@ -118,8 +118,10 @@ namespace RT64 {
         int32_t framesToPresent = 1;
         int wcw_reason = 0; // [wcw] DIAGNOSTIC present outcome: 0=vi-not-visible 1=ok 2=target-empty 3=scratch
         uint32_t wcw_addr = 0; // [wcw] DIAGNOSTIC: address of the fb actually presented
+        uint64_t wcwPairBlendSerial = 0; // [wcw fix] run serial of the blend shown at i=0
         bool lockedWorkloadMutex = false;
-        InterpolatedFrameCounters &frameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
+        const uint32_t wcwPresentSetIndex = ext.sharedResources->interpolatedFramesIndex;
+        InterpolatedFrameCounters &frameCounters = ext.sharedResources->interpolatedFrames[wcwPresentSetIndex];
 
         // TODO: There's a possible race condition interactions that can happen while the workload
         // queue is rendering extra frames and the present event is processed while it's generating
@@ -189,6 +191,20 @@ namespace RT64 {
                         }
                     }
 
+                    // [wcw fix] This game double-buffers in a match, so the buffer just drawn is never the
+                    // one being presented and the check below never passes. Allow interpolation for a
+                    // buffer that VI history shows was presented, without changing what is presented.
+                    if (!colorFb->interpolationEnabled && !present.debuggerFramebuffer.view) {
+                        for (size_t h = 0; h < viHistory.history.size(); h++) {
+                            const VIHistory::Present &entry = viHistory.history[h];
+                            if ((colorFb->addressStart == entry.vi.fbAddress()) && (colorFb->width == entry.fbWidth) &&
+                                (colorFb->siz == entry.vi.fbSiz()) && entry.vi.compatibleWith(present.screenVI)) {
+                                colorFb->interpolationEnabled = true;
+                                break;
+                            }
+                        }
+                    }
+
                     // Present early (or games that behave like it) will make it so that the presented image is a color image
                     // that the workload modified. We run a basic check to see if that holds true to indicate it was presented
                     // so interpolation is possible.
@@ -219,8 +235,44 @@ namespace RT64 {
                     ext.sharedResources->workloadMutex.lock();
                 }
 
+                // [wcw fix] Note which run's blend this buffer holds, so the real frame presented next
+                // can be taken from the same run.
+                {
+                    const uint32_t pairSl = (presentFb->addressStart >> 10) & 3;
+                    wcwPairBlendSerial = (RT64::wcwAddrSlotAddr[pairSl].load(std::memory_order_relaxed) == presentFb->addressStart) ? RT64::wcwAddrSlotSerial[pairSl].load(std::memory_order_relaxed) : 0;
+                }
+
                 RenderTargetKey colorTargetKey(presentFb->addressStart, presentFb->width, presentFb->siz, Framebuffer::Type::Color);
                 colorTarget = &targetManager.get(colorTargetKey, true);
+
+                // [wcw fix] In multi-layer match frames, never show a game framebuffer whose run has not
+                // finished rendering as the blend: repeat the newest complete real frame instead.
+                // (Single-layer screens are excluded: their completion stamp lags while they are fine.)
+                bool wcwUsingRealFrame = false;
+                if ((framesToPresent > 1) && !usingMSAA && RT64::wcwInterpActive.load(std::memory_order_relaxed) && (wcwPairBlendSerial > 0) &&
+                    (RT64::wcwLastRunLength.load(std::memory_order_relaxed) >= 4)) {
+                    const uint32_t sl = (presentFb->addressStart >> 10) & 3;
+                    const bool complete = (RT64::wcwAddrSlotComplete[sl].load(std::memory_order_relaxed) == wcwPairBlendSerial);
+                    if (!complete) {
+                        uint64_t bestReal = 0;
+                        int bestRealK = -1;
+                        for (int k = 0; k < 3; k++) {
+                            const uint64_t rs = RT64::wcwSlotRealSerial[k].load(std::memory_order_relaxed);
+                            if ((rs > bestReal) && (RT64::wcwSlotRealComplete[k].load(std::memory_order_relaxed) == rs)) {
+                                bestReal = rs;
+                                bestRealK = k;
+                            }
+                        }
+
+                        auto &realTargets = (bestRealK == 0) ? ext.sharedResources->interpolatedColorTargets
+                            : ((bestRealK == 1) ? ext.sharedResources->wcwInterpolatedColorTargetsB : ext.sharedResources->wcwInterpolatedColorTargetsC);
+                        if ((bestRealK >= 0) && !realTargets.empty() && (realTargets[0] != nullptr)) {
+                            colorTarget = realTargets[0].get();
+                            wcwUsingRealFrame = true;
+                        }
+                    }
+                }
+
                 // [wcw] DIAGNOSTIC: report whether the present found a non-empty rendered target.
                 { static int pn = 0; static const bool wcwTrace = getenv("WCW_TRACE") != nullptr; if (wcwTrace && (pn++ % 61) == 0) fprintf(stderr, "[wcw][blit#%d] addr=0x%X w=%d siz=%d empty=%d interp=%d\n",
                     pn, presentFb->addressStart, (int)presentFb->width, (int)presentFb->siz, (int)colorTarget->isEmpty(), (int)presentFb->interpolationEnabled); }
@@ -228,7 +280,7 @@ namespace RT64 {
                     wcw_reason = 1;
                     wcw_addr = presentFb->addressStart;
                     // If a depth framebuffer is about to be shown, convert it to color.
-                    if (presentFb->isLastWriteDifferent(Framebuffer::Type::Color)) {
+                    if (!wcwUsingRealFrame && presentFb->isLastWriteDifferent(Framebuffer::Type::Color)) {
                         RenderTargetKey otherColorTargetKey(presentFb->addressStart, presentFb->width, presentFb->siz, presentFb->lastWriteType);
                         RenderTarget &otherColorTarget = targetManager.get(otherColorTargetKey, true);
                         if (!otherColorTarget.isEmpty()) {
@@ -316,12 +368,15 @@ namespace RT64 {
                 // Stall until the interpolated color target is available.
                 const uint32_t targetIndex = usingMSAA ? i : (i - 1);
                 std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
-                ext.sharedResources->interpolatedCondition.wait(interpolatedLock, [&]() {
+                // [wcw fix] Bounded wait: in a multi-layer frame only the last layer makes the target
+                // available, and an unbounded wait here can stall VI and with it the game logic that
+                // would complete the frame. On timeout this frame is dropped like a skipped one.
+                const bool wcwInterpTimedOut = !ext.sharedResources->interpolatedCondition.wait_for(interpolatedLock, RT64::wcwCoherentWaitBound(), [&]() {
                     return (frameCounters.available > targetIndex) || ((frameCounters.available == targetIndex) && frameCounters.skipped);
                 });
 
                 // Do not present any more frames after this one after reaching the last available frame if the workload was skipped.
-                if ((frameCounters.available == targetIndex) && frameCounters.skipped) {
+                if (wcwInterpTimedOut || ((frameCounters.available == targetIndex) && frameCounters.skipped)) {
                     framesToPresent = std::min(int(frameCounters.available), i + 1);
                     frameCountersNextPresented = frameCounters.count;
                 }
@@ -331,7 +386,22 @@ namespace RT64 {
 
                 if (i < framesToPresent) {
                     uint32_t targetIndex = usingMSAA ? i : (i - 1);
-                    colorTarget = ext.sharedResources->interpolatedColorTargets[targetIndex].get();
+                    // [wcw fix] Counter set 1 uses the second set of interpolated targets.
+                    auto &wcwTargets = ((wcwPresentSetIndex & 1) != 0) ? ext.sharedResources->wcwInterpolatedColorTargetsB : ext.sharedResources->interpolatedColorTargets;
+                    colorTarget = (targetIndex < wcwTargets.size()) ? wcwTargets[targetIndex].get() : nullptr;
+                    // [wcw fix] Show the real frame of the same run as the blend just shown, from its
+                    // rotating slot (serial % 3), once that run has finished.
+                    if (wcwPairBlendSerial > 0) {
+                        const uint32_t k = uint32_t(wcwPairBlendSerial % 3);
+                        if ((RT64::wcwSlotRealSerial[k].load(std::memory_order_relaxed) == wcwPairBlendSerial) &&
+                            (RT64::wcwSlotRealComplete[k].load(std::memory_order_relaxed) == wcwPairBlendSerial)) {
+                            auto &slotTargets = (k == 0) ? ext.sharedResources->interpolatedColorTargets
+                                : ((k == 1) ? ext.sharedResources->wcwInterpolatedColorTargetsB : ext.sharedResources->wcwInterpolatedColorTargetsC);
+                            if (targetIndex < slotTargets.size()) {
+                                colorTarget = slotTargets[targetIndex].get();
+                            }
+                        }
+                    }
                 }
                 else {
                     colorTarget = nullptr;

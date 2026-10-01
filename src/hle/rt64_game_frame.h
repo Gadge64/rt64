@@ -24,6 +24,10 @@ namespace RT64 {
             uint32_t workloadIndex;
             uint32_t fbPairIndex;
             uint32_t projectionIndex;
+            // [wcw fix] The workload's submissionFrame and the framebuffer pair's resetGeneration at capture
+            // time: if either has changed when the projection is read, its ring slot was reused.
+            uint64_t submissionFrame = 0;
+            uint64_t fbPairResetGeneration = 0;
         };
 
         struct Call {
@@ -53,6 +57,10 @@ namespace RT64 {
             RigidBody rigidBody;
             uint32_t prevTransformIndex = 0;
             bool mapped = false;
+            // [wcw fix] Interpolated from the camera-independent matrices (camera re-applied afterwards).
+            bool usedPureMatrix = false;
+            // [wcw fix] Blend the drawn matrices componentwise instead (see GameFrame::matchTransform).
+            bool wcwCombinedLerp = false;
         };
 
         struct TileMap {

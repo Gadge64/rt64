@@ -5,10 +5,19 @@
 #include "rt64_math.h"
 
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <memory>
 
 namespace RT64 {
+    std::atomic<bool> wcwInterpActive = { false };
+    std::atomic<uint32_t> wcwLastRunLength = { 0 };
+    std::atomic<uint64_t> wcwSlotRealSerial[3] = {};
+    std::atomic<uint64_t> wcwSlotRealComplete[3] = {};
+    std::atomic<uint32_t> wcwAddrSlotAddr[4] = {};
+    std::atomic<uint64_t> wcwAddrSlotSerial[4] = {};
+    std::atomic<uint64_t> wcwAddrSlotComplete[4] = {};
+
     float sqr(float x) {
         return x * x;
     }
@@ -430,7 +439,38 @@ namespace RT64 {
     DecomposedTransform lerpTransforms(const DecomposedTransform& a, const DecomposedTransform& b, float weight,
         bool lerpTranslation, bool lerpRotation, bool lerpScale, bool lerpSkew, bool lerpPerpsective, bool useSlerp)
     {
-        assert(a.valid && b.valid);
+        // [wcw fix] Matrices that do not decompose cleanly (degenerate UI/setup matrices) cannot be
+        // interpolated: render them at the target transform instead of asserting.
+        if (!a.valid || !b.valid) {
+            return b.valid ? b : a;
+        }
+
+        // [wcw fix] In a match, also reject decompositions that are valid but unstable from one frame
+        // to the next (a mirrored axis, a near-zero or sharply changing scale, as seen on near
+        // edge-on billboards at low camera angles). Those render at the target transform.
+        if (wcwInterpActive.load(std::memory_order_relaxed)) {
+            if (a.coordinateFlip != b.coordinateFlip) {
+                return b;
+            }
+
+            const hlslpp::float3 aScale = abs(a.scale);
+            const hlslpp::float3 bScale = abs(b.scale);
+            const float minScale = 1e-4f;
+            const float maxRatio = 4.0f;
+            for (int i = 0; i < 3; i++) {
+                const float as = aScale[i];
+                const float bs = bScale[i];
+                if ((as < minScale) || (bs < minScale)) {
+                    return b;
+                }
+
+                const float ratio = (as > bs) ? (as / bs) : (bs / as);
+                if (ratio > maxRatio) {
+                    return b;
+                }
+            }
+        }
+
         DecomposedTransform ret;
 
         // Lerp the individual fields based on the provided flags.
@@ -441,6 +481,9 @@ namespace RT64 {
             ret.translation = b.translation;
         }
 
+        // [wcw fix] Always slerp in a match: plain quaternion lerp leaves the unit sphere and adds
+        // shear to the recomposed matrix at large angular deltas.
+        useSlerp = useSlerp || wcwInterpActive.load(std::memory_order_relaxed);
         if (lerpRotation) {
             if (float(dot(a.rotation, b.rotation)) > 0.0f) {
                 if (useSlerp) {

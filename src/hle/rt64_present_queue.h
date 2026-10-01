@@ -12,7 +12,8 @@
 #include "rt64_present.h"
 #include "rt64_shared_queue_resources.h"
 
-#define PRESENT_QUEUE_SIZE 4
+// [wcw fix] Grown from 4 (keep in step with WORKLOAD_QUEUE_SIZE).
+#define PRESENT_QUEUE_SIZE 8
 
 namespace RT64 {
     struct WorkloadQueue;

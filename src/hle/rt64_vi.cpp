@@ -188,13 +188,30 @@ namespace RT64 {
     }
 
     uint32_t VIHistory::logicalRateFromFactors() {
-        if ((factors[0] != 0) && std::all_of(factors.begin(), factors.end(), [&](uint32_t factor) { return factor == factors[0]; })) {
-            const uint32_t FullRate = 60; // TODO: PAL support.
-            return FullRate / factors[0];
+        // [wcw fix] Tolerate a single-sample outlier instead of requiring strict unanimous
+        // agreement across all history slots: real gameplay VI timing has occasional one-tick
+        // jitter (camera cuts, hit effects), which previously zeroed out rate detection for a
+        // beat and made interpolation flicker on/off instead of running consistently. Accept a
+        // 2-of-3 majority match instead of requiring all 3 to agree.
+        for (size_t i = 0; i < factors.size(); i++) {
+            if (factors[i] == 0) {
+                continue;
+            }
+
+            uint32_t matches = 0;
+            for (size_t j = 0; j < factors.size(); j++) {
+                if (factors[j] == factors[i]) {
+                    matches++;
+                }
+            }
+
+            if (matches >= 2) {
+                const uint32_t FullRate = 60; // TODO: PAL support.
+                return FullRate / factors[i];
+            }
         }
-        else {
-            return 0;
-        }
+
+        return 0;
     }
 
     const VIHistory::Present &VIHistory::top() const {

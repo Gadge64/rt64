@@ -4,9 +4,29 @@
 
 #pragma once
 
+#include <chrono>
 #include "rt64_common.h"
 
+#include <atomic>
+
 namespace RT64 {
+    // [wcw fix] Set once frame matching has started (60Hz target above the game's rate). The 60Hz changes
+    // for this game apply only while it is set, so the renderer behaves as stock RT64 until then.
+    extern std::atomic<bool> wcwInterpActive;
+    // [wcw fix] Number of layers in the last completed multi-layer frame (a "run").
+    extern std::atomic<uint32_t> wcwLastRunLength;
+    // [wcw fix] Per rotating target set (run serial % 3): the run whose real frame it holds, and that run
+    // once it has finished rendering.
+    extern std::atomic<uint64_t> wcwSlotRealSerial[3];
+    extern std::atomic<uint64_t> wcwSlotRealComplete[3];
+    // [wcw fix] Per game colour buffer (4 slots keyed by (address >> 10) & 3): the run whose blend it holds,
+    // and that run once it has finished rendering.
+    extern std::atomic<uint32_t> wcwAddrSlotAddr[4];
+    extern std::atomic<uint64_t> wcwAddrSlotSerial[4];
+    extern std::atomic<uint64_t> wcwAddrSlotComplete[4];
+    // [wcw fix] Bound for the frame-pacing waits between the render and present threads (two refreshes).
+    inline std::chrono::milliseconds wcwCoherentWaitBound() { return std::chrono::milliseconds(34); }
+
     inline constexpr uint32_t swappedOffset(uint32_t i) {
         return i ^ 3;
     }

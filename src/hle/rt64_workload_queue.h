@@ -23,7 +23,11 @@
 #   include "render/rt64_raytracing_shader_cache.h"
 #endif
 
-#define WORKLOAD_QUEUE_SIZE 4
+// [wcw fix] Grown from 4 (keep in step with PRESENT_QUEUE_SIZE).
+#define WORKLOAD_QUEUE_SIZE 8
+// [wcw fix] Workload slots after the ring, never written by the producer: snapshots of recent layers so the
+// next frame can still pair with them after their ring slot is recycled.
+#define WCW_SNAPSHOT_SLOTS 16
 
 namespace RT64 {
     struct PresentQueue;
@@ -61,7 +65,21 @@ namespace RT64 {
         };
 
         External ext;
-        std::array<Workload, WORKLOAD_QUEUE_SIZE> workloads;
+        std::array<Workload, WORKLOAD_QUEUE_SIZE + WCW_SNAPSHOT_SLOTS> workloads;
+        // [wcw fix] Latest wrestler-layer snapshot: its GameFrame, workload slot and present.
+        uint32_t wcwSnapFrameIndex = UINT32_MAX;
+        uint32_t wcwSnapWorkloadIndex = UINT32_MAX;
+        uint64_t wcwSnapPresentId = 0;
+        // [wcw fix] One entry per snapshot slot: the GameFrame that points at it, the run it came from, its
+        // position in that run and its transform count.
+        struct WcwLayerSnap {
+            uint32_t frameIndex = UINT32_MAX;
+            uint64_t runSerial = 0;
+            uint32_t runPos = 0;
+            uint32_t xf = 0;
+        };
+        WcwLayerSnap wcwLayerSnaps[WCW_SNAPSHOT_SLOTS];
+        uint32_t wcwSnapCounter = 0;
         int threadCursor;
         int writeCursor;
         int barrierCursor;
@@ -97,9 +115,20 @@ namespace RT64 {
         ProfilingTimer rendererGPUProfiler = ProfilingTimer(120);
         ProfilingTimer matchingProfiler = ProfilingTimer(120);
         ProfilingTimer workloadProfiler = ProfilingTimer(120);
-        std::array<GameFrame, 2> gameFrames;
+        // [wcw fix] Grown from 2: a layer is paired with the same layer one displayed frame (several
+        // GameFrames) back.
+        std::array<GameFrame, 16> gameFrames;
         uint32_t prevFrameIndex = uint32_t(gameFrames.size()) - 1;
         uint32_t curFrameIndex = 0;
+
+        // [wcw fix] Multi-layer frame detection: AKI games compose one displayed frame from several consecutive
+        // workloads targeting the same colour address. Remembers, per address, how long its last run was.
+        uint32_t lastGroupColorAddress = 0;
+        bool hasLastGroupColorAddress = false;
+        uint32_t currentGroupRunLength = 0;
+        struct RecentColorGroup { uint32_t address = 0; uint32_t runLength = 0; };
+        std::array<RecentColorGroup, 8> recentColorGroups{};
+        size_t recentColorGroupsNext = 0;
 
         WorkloadQueue();
         ~WorkloadQueue();

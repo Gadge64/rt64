@@ -52,6 +52,9 @@ namespace RT64 {
         std::vector<uint32_t> colorImageAddressVector;
         std::unordered_set<uint32_t> colorImageAddressSet;
         std::vector<std::unique_ptr<RenderTarget>> interpolatedColorTargets;
+        // [wcw fix] Two more sets of interpolated targets: sets are chosen by run serial % 3.
+        std::vector<std::unique_ptr<RenderTarget>> wcwInterpolatedColorTargetsB;
+        std::vector<std::unique_ptr<RenderTarget>> wcwInterpolatedColorTargetsC;
         InterpolatedFrameCounters interpolatedFrames[2];
         uint32_t interpolatedFramesIndex = 0;
         std::mutex interpolatedMutex;

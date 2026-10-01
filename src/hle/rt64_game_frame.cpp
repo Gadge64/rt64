@@ -9,6 +9,8 @@
 
 #include "xxHash/xxh3.h"
 
+#include <cmath>
+
 namespace RT64 {
     // GameFrame
     
@@ -104,7 +106,7 @@ namespace RT64 {
             for (uint32_t f = 0; f < workload.fbPairCount; f++) {
                 const FramebufferPair &fbPair = workload.fbPairs[f];
                 for (uint32_t p = 0; p < fbPair.projectionCount; p++) {
-                    const GameIndices::Projection newProj = { w, f, p };
+                    const GameIndices::Projection newProj = { w, f, p, workload.submissionFrame, fbPair.resetGeneration };
                     const auto &fbPairProj = fbPair.projections[p];
                     switch (fbPairProj.type) {
                     case Projection::Type::Perspective:
@@ -309,7 +311,24 @@ namespace RT64 {
                     prevIt++;
                 }
                 else {
-                    matchTransform(curWorkload, prevWorkload, curWorkloadMap, prevWorkloadMap, curIt->second, prevIt->second, modifiedBuffers);
+                    // [wcw fix] The previous workload's id map and draw data live in the recycled workload
+                    // ring, so check every index before using it. A pair whose previous map is sized for
+                    // different content is stale and is skipped, as is one whose matrices are not finite.
+                    const uint32_t curIndex = curIt->second;
+                    const uint32_t prevIndex = prevIt->second;
+                    const bool curInRange = (curIndex < curWorkloadMap.transforms.size()) && (curIndex < curWorkload.drawData.worldTransforms.size());
+                    const bool prevInRange = (prevIndex < prevWorkload.drawData.worldTransforms.size()) &&
+                        ((prevWorkloadMap == nullptr) || (prevIndex < prevWorkloadMap->transforms.size()));
+                    if (curInRange && prevInRange) {
+                        const bool bothPure = (curWorkload.drawData.worldTransformsPureValid[curIndex] != 0) &&
+                            (prevWorkload.drawData.worldTransformsPureValid[prevIndex] != 0);
+                        const hlslpp::float4x4 &curMtx = bothPure ? curWorkload.drawData.worldTransformsPure[curIndex] : curWorkload.drawData.worldTransforms[curIndex];
+                        const hlslpp::float4x4 &prevMtx = bothPure ? prevWorkload.drawData.worldTransformsPure[prevIndex] : prevWorkload.drawData.worldTransforms[prevIndex];
+                        if (std::isfinite(float(hlslpp::length(curMtx[3].xyz - prevMtx[3].xyz)))) {
+                            matchTransform(curWorkload, prevWorkload, curWorkloadMap, prevWorkloadMap, curIndex, prevIndex, modifiedBuffers);
+                        }
+                    }
+
                     curIt++;
                     prevIt++;
                 }
@@ -373,7 +392,13 @@ namespace RT64 {
         };
 
         matchScenes(perspectiveScenes, prevFrame.perspectiveScenes);
-        matchScenes(orthographicScenes, prevFrame.orthographicScenes);
+
+        // [wcw fix] AKI games force-load combined MVPs and never set a projection matrix, so all of this
+        // game's content (wrestlers, ring, ropes) is classified orthographic. Match it during a match;
+        // elsewhere orthographic scenes are left unmatched.
+        if (wcwInterpActive.load(std::memory_order_relaxed)) {
+            matchScenes(orthographicScenes, prevFrame.orthographicScenes);
+        }
 
         if (!workloadsModified.empty()) {
             thread_local std::vector<BufferUploader::Upload> uploads;
@@ -398,8 +423,33 @@ namespace RT64 {
         }
     }
 
+    // [wcw fix] A projection is stale when its workload slot was recycled (submissionFrame) or its
+    // framebuffer pair was reset (resetGeneration) after GameFrame::set captured it.
+    static bool isProjectionStale(const WorkloadQueue &workloadQueue, const GameIndices::Projection &proj) {
+        const Workload &w = workloadQueue.workloads[proj.workloadIndex];
+        if (w.submissionFrame != proj.submissionFrame) {
+            return true;
+        }
+
+        return w.fbPairs[proj.fbPairIndex].resetGeneration != proj.fbPairResetGeneration;
+    }
+
+    static bool sceneHasStaleProjection(const WorkloadQueue &workloadQueue, const GameScene &scene) {
+        for (const GameIndices::Projection &proj : scene.projections) {
+            if (isProjectionStale(workloadQueue, proj)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     void GameFrame::matchScene(WorkloadQueue &workloadQueue, const GameFrame &prevFrame, const GameScene &curScene, const GameScene &prevScene, std::unordered_map<uint32_t, ModifiedBuffers> &workloadsModified, bool &tileInterpolationUsed, bool &lookAtInterpolationUsed) {
         if (curScene.projections.empty() || prevScene.projections.empty()) {
+            return;
+        }
+
+        if (sceneHasStaleProjection(workloadQueue, curScene) || sceneHasStaleProjection(workloadQueue, prevScene)) {
             return;
         }
 
@@ -460,8 +510,9 @@ namespace RT64 {
                 const TransformGroup &curProjGroup = curWorkload.drawData.transformGroups[curProjGroupIndex];
                 const TransformGroup &prevProjGroup = prevWorkload.drawData.transformGroups[prevProjGroupIndex];
 
-                // Cameras usually look better with simple interpolation, so default decomposition to off.
-                bool projectionDecompose = false;
+                // [wcw fix] Decompose the camera: this game's untagged camera always takes this default, and
+                // a componentwise lerp of a rotating camera is not a rotation.
+                bool projectionDecompose = true;
                 uint8_t projectionLinearComponent = G_EX_COMPONENT_INTERPOLATE;
                 uint8_t projectionAngularComponent = G_EX_COMPONENT_INTERPOLATE;
                 uint8_t projectionScaleComponent = G_EX_COMPONENT_INTERPOLATE;
@@ -715,16 +766,62 @@ namespace RT64 {
             curTransformMap.rigidBody = prevWorkloadMap->transforms[prevTransformIndex].rigidBody;
         }
 
-        const hlslpp::float4x4 &curTransform = curWorkload.drawData.worldTransforms[curTransformIndex];
-        const hlslpp::float4x4 &prevTransform = prevWorkload.drawData.worldTransforms[prevTransformIndex];
+        // [wcw fix] Only interpolate when both frames have the camera-independent matrix: decomposing a
+        // combined model*camera matrix is not meaningful. Otherwise leave the transform unmatched.
+        const bool useCurPure = curWorkload.drawData.worldTransformsPureValid[curTransformIndex] != 0;
+        const bool usePrevPure = prevWorkload.drawData.worldTransformsPureValid[prevTransformIndex] != 0;
+        if (!useCurPure || !usePrevPure) {
+            return;
+        }
+
+        const hlslpp::float4x4 &curTransform = curWorkload.drawData.worldTransformsPure[curTransformIndex];
+        const hlslpp::float4x4 &prevTransform = prevWorkload.drawData.worldTransformsPure[prevTransformIndex];
         const uint32_t curGroupIndex = curWorkload.drawData.worldTransformGroups[curTransformIndex];
         const TransformGroup &curGroup = curWorkload.drawData.transformGroups[curGroupIndex];
         curTransformMap.rigidBody.updateLinear(prevTransform, curTransform, curGroup.positionInterpolation);
-        curTransformMap.rigidBody.updateAngular(prevTransform, curTransform, curGroup.rotationInterpolation, curGroup.scaleInterpolation, curGroup.skewInterpolation);
+        // [wcw fix] Skew is the least stable part of the decomposition (billboarded crowd); don't interpolate it.
+        curTransformMap.rigidBody.updateAngular(prevTransform, curTransform, curGroup.rotationInterpolation, curGroup.scaleInterpolation, G_EX_COMPONENT_SKIP);
         curTransformMap.rigidBody.updatePerspective(prevTransform, curTransform, curGroup.perspectiveInterpolation);
+
+        // [wcw fix] Flag pairs whose drawn (combined) matrix changed by less than 30% to be blended
+        // componentwise from the drawn matrices instead (TransformProcessor). The camera-independent pair
+        // can swing through a large phantom rotation between frames while the drawn matrix barely moves.
+        // In a match this applies to every pair; elsewhere only to pairs that rotate more than 30 degrees
+        // or change scale by more than 25%.
+        {
+            bool candidate = wcwInterpActive.load(std::memory_order_relaxed);
+            if (!candidate) {
+                const DecomposedTransform a(prevTransform);
+                const DecomposedTransform b(curTransform);
+                candidate = !a.valid || !b.valid;
+                if (!candidate) {
+                    const float d = std::min(1.0f, std::abs(float(hlslpp::dot(a.rotation, b.rotation))));
+                    const float angleDeg = 2.0f * std::acos(d) * 57.2958f;
+                    const float ratio = std::max(float(hlslpp::length(hlslpp::abs(a.scale))), 1e-6f) / std::max(float(hlslpp::length(hlslpp::abs(b.scale))), 1e-6f);
+                    candidate = (angleDeg > 30.0f) || (ratio > 1.25f) || (ratio < 0.8f);
+                }
+            }
+
+            curTransformMap.wcwCombinedLerp = false;
+            if (candidate) {
+                float cc[16], cp[16];
+                hlslpp::store(hlslpp::float4x4(curWorkload.drawData.worldTransforms[curTransformIndex]), cc);
+                hlslpp::store(hlslpp::float4x4(prevWorkload.drawData.worldTransforms[prevTransformIndex]), cp);
+                double num = 0.0, den = 0.0;
+                bool finite = true;
+                for (int k = 0; k < 16; k++) {
+                    finite = finite && std::isfinite(cc[k]) && std::isfinite(cp[k]);
+                    num += double(cc[k] - cp[k]) * double(cc[k] - cp[k]);
+                    den += double(cc[k]) * double(cc[k]);
+                }
+
+                curTransformMap.wcwCombinedLerp = finite && (den > 0.0) && (std::sqrt(num / den) < 0.3);
+            }
+        }
         curTransformMap.rigidBody.updateDecomposition(curTransform, curGroup.decompose);
         curTransformMap.prevTransformIndex = prevTransformIndex;
         curTransformMap.mapped = true;
+        curTransformMap.usedPureMatrix = true;
         curWorkloadMap.prevTransformsMapped[prevTransformIndex] = true;
 
         uint64_t curVertexHash = 0;
@@ -733,7 +830,12 @@ namespace RT64 {
         uint32_t curVertexCount = curWorkload.drawData.worldTransformVertexCount(curTransformIndex);
         uint32_t prevVertexIndex = prevWorkload.drawData.worldTransformVertexIndices[prevTransformIndex];
         uint32_t prevVertexCount = prevWorkload.drawData.worldTransformVertexCount(prevTransformIndex);
-        if (((curGroup.vertexInterpolation != G_EX_COMPONENT_SKIP) || (curGroup.texcoordInterpolation == G_EX_COMPONENT_AUTO)) && (curVertexCount == prevVertexCount)) {
+        // [wcw fix] Bounds-check the vertex ranges before reading them (recycled workload data).
+        const bool vertexRangesInBounds =
+            ((size_t(curVertexIndex) + curVertexCount) * 3 <= curWorkload.drawData.posFloats.size()) &&
+            ((size_t(prevVertexIndex) + prevVertexCount) * 3 <= prevWorkload.drawData.posFloats.size()) &&
+            ((size_t(curVertexIndex) + curVertexCount) * 3 <= curWorkload.drawData.velFloats.size());
+        if (((curGroup.vertexInterpolation != G_EX_COMPONENT_SKIP) || (curGroup.texcoordInterpolation == G_EX_COMPONENT_AUTO)) && (curVertexCount == prevVertexCount) && vertexRangesInBounds) {
             const std::vector<float> &curPosFloats = curWorkload.drawData.posFloats;
             const std::vector<float> &prevPosFloats = prevWorkload.drawData.posFloats;
             std::vector<float> &curVelFloats = curWorkload.drawData.velFloats;
@@ -754,7 +856,11 @@ namespace RT64 {
             }
         }
 
-        if ((curGroup.texcoordInterpolation != G_EX_COMPONENT_SKIP) && (curVertexCount == prevVertexCount)) {
+        const bool texcoordRangesInBounds =
+            ((size_t(curVertexIndex) + curVertexCount) * 2 <= curWorkload.drawData.tcFloats.size()) &&
+            ((size_t(prevVertexIndex) + prevVertexCount) * 2 <= prevWorkload.drawData.tcFloats.size()) &&
+            ((size_t(curVertexIndex) + curVertexCount) * 2 <= curWorkload.drawData.tcVelFloats.size());
+        if ((curGroup.texcoordInterpolation != G_EX_COMPONENT_SKIP) && (curVertexCount == prevVertexCount) && texcoordRangesInBounds) {
             const std::vector<float> &curTcFloats = curWorkload.drawData.tcFloats;
             const std::vector<float> &prevTcFloats = prevWorkload.drawData.tcFloats;
             std::vector<float> &curVelFloats = curWorkload.drawData.tcVelFloats;
@@ -794,12 +900,23 @@ namespace RT64 {
             for (uint32_t m = call.callDesc.minWorldMatrix; m <= call.callDesc.maxWorldMatrix; m++) {
                 const uint32_t groupIndex = workload.drawData.worldTransformGroups[m];
                 const TransformGroup &group = workload.drawData.transformGroups[groupIndex];
-                matrixIdHash = matrixIdHash * 33 ^ group.matrixId;
+                // [wcw fix] Untagged matrices (this game never tags them) all share G_EX_ID_AUTO; use the
+                // matrix's source address as a stable per-object identity instead.
+                const uint32_t idForHash = (group.matrixId != G_EX_ID_AUTO) ? group.matrixId : workload.drawData.worldTransformPhysicalAddresses[m];
+                matrixIdHash = matrixIdHash * 33 ^ idForHash;
 
                 const bool usesIdWithAutoOrdering = (group.matrixId != G_EX_ID_AUTO) && (group.matrixId != G_EX_ID_IGNORE) && (group.ordering == G_EX_ORDER_AUTO);
                 doTransformMatching = doTransformMatching || (group.matrixId == G_EX_ID_AUTO) || usesIdWithAutoOrdering;
                 doTileInterpolation = doTileInterpolation || (group.tileInterpolation != G_EX_COMPONENT_SKIP);
                 doTileMatching = doTileMatching || (group.tileInterpolation == G_EX_COMPONENT_AUTO);
+            }
+
+            // [wcw fix] Fold in the bound textures' content hashes, so 2D draws (no world matrix) with the
+            // same render state are told apart by what they draw.
+            for (uint32_t t = 0; t < call.callDesc.tileCount; t++) {
+                const DrawCallTile &callTile = workload.drawData.callTiles[call.callDesc.tileIndex + t];
+                const uint64_t tileHash = callTile.tmemHashOrID;
+                matrixIdHash = matrixIdHash * 33 ^ (uint32_t)(tileHash ^ (tileHash >> 32));
             }
 
             hashMap.emplace(hashFromCall(call, matrixIdHash), GameCallMap{ sceneProjIndex, c, doTransformMatching, doTileInterpolation, doTileMatching });
@@ -809,12 +926,27 @@ namespace RT64 {
     void GameFrame::buildTransformIdMap(const Workload &workload, std::multimap<uint32_t, uint32_t> &idMap, std::vector<uint32_t> &ignoredIdVector) const {
         idMap.clear();
         ignoredIdVector.clear();
+        // [wcw fix] Ordinal of each untagged transform within its object, see below.
+        thread_local std::unordered_map<uint32_t, uint32_t> autoIdOrdinals;
+        autoIdOrdinals.clear();
+        const bool autoIdFromAddr = wcwInterpActive.load(std::memory_order_relaxed);
 
         uint32_t transformCount = uint32_t(workload.drawData.worldTransformGroups.size());
         for (uint32_t i = 0; i < transformCount; i++) {
             const uint32_t groupIndex = workload.drawData.worldTransformGroups[i];
             const TransformGroup &group = workload.drawData.transformGroups[groupIndex];
             if (group.matrixId == G_EX_ID_AUTO) {
+                // [wcw fix] This game never tags its matrices. In a match, give each untagged transform the
+                // key "Nth transform of the object at this address", which is stable from frame to frame;
+                // transforms with no known object address stay unkeyed.
+                if (autoIdFromAddr && (i < workload.drawData.worldTransformPhysicalAddresses.size())) {
+                    const uint32_t addr = workload.drawData.worldTransformPhysicalAddresses[i];
+                    if (addr != 0) {
+                        const uint32_t ordinal = autoIdOrdinals[addr]++;
+                        idMap.emplace(addr ^ (ordinal * 0x9E3779B9u), i);
+                    }
+                }
+
                 continue;
             }
             else if (group.matrixId == G_EX_ID_IGNORE) {
@@ -838,6 +970,8 @@ namespace RT64 {
         CallMatchKey key;
         key.colorCombiner = call.callDesc.colorCombiner;
         key.otherMode = call.callDesc.otherMode;
+        // [wcw fix] The dither bits (ALPHADITHER/RGBDITHER) cycle between frames on identical draws.
+        key.otherMode.H &= ~0xF0u;
         key.geometryMode = call.callDesc.geometryMode;
         key.triangleCount = call.callDesc.triangleCount;
         key.matrixIdHash = matrixIdHash;

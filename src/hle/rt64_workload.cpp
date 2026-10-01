@@ -74,6 +74,9 @@ namespace RT64 {
         drawData.lerpRspLookAt.clear();
         drawData.loadOperations.clear();
         drawData.worldTransforms.clear();
+        drawData.worldTransformsPure.clear();
+        drawData.worldTransformsCamera.clear();
+        drawData.worldTransformsPureValid.clear();
         drawData.viewTransforms.clear();
         drawData.projTransforms.clear();
         drawData.viewProjTransforms.clear();
@@ -106,6 +109,10 @@ namespace RT64 {
         drawData.projTransforms.push_back(interop::float4x4::identity());
         drawData.viewProjTransforms.push_back(interop::float4x4::identity());
         drawData.worldTransforms.push_back(interop::float4x4::identity());
+        // [wcw fix] Keep the parallel pure/camera arrays index-aligned with worldTransforms.
+        drawData.worldTransformsPure.push_back(hlslpp::float4x4::identity());
+        drawData.worldTransformsCamera.push_back(hlslpp::float4x4::identity());
+        drawData.worldTransformsPureValid.push_back(0);
         drawData.transformGroups.push_back(TransformGroup());
         drawData.worldTransformGroups.push_back(0);
         drawData.viewProjTransformGroups.push_back(0);

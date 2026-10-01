@@ -10,6 +10,7 @@ namespace RT64 {
     // FramebufferPair
 
     void FramebufferPair::reset() {
+        resetGeneration++;
         fastPaths = {};
         flushReason = FlushReason::None;
         displayListAddress = 0;

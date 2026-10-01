@@ -55,6 +55,11 @@ namespace RT64 {
         std::vector<interop::float4x4> prevWorldTransforms;
         std::vector<interop::float4x4> invTWorldTransforms;
         std::vector<interop::float4x4> lerpWorldTransforms;
+        // [wcw fix] Parallel to worldTransforms: the camera-independent matrix and the camera it was combined
+        // with, when the game-side hooks provided them (worldTransformsPureValid).
+        std::vector<interop::float4x4> worldTransformsPure;
+        std::vector<interop::float4x4> worldTransformsCamera;
+        std::vector<uint8_t> worldTransformsPureValid;
         std::vector<interop::RDPTile> rdpTiles;
         std::vector<interop::RDPTile> lerpRdpTiles;
         std::vector<interop::GPUTile> gpuTiles;
@@ -233,6 +238,8 @@ namespace RT64 {
         std::vector<uint32_t> transformIgnoredIds;
         uint64_t workloadId = 0;
         uint64_t presentId = 0;
+        // [wcw fix] Serial number of the displayed frame (run of layers) this workload belongs to.
+        uint64_t wcwRunSerial = 0;
         bool paused = false;
 
         struct {
