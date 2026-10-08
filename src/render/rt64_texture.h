@@ -20,6 +20,7 @@ namespace RT64 {
         uint32_t mipmaps = 0;
         uint64_t memorySize = 0;
         std::vector<uint8_t> bytesTMEM;
+        std::string legacyKeys;
         bool decodeTMEM = false;
     };
 };

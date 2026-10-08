@@ -956,6 +956,7 @@ namespace RT64 {
         uint32_t wcwInterpFlushIndex = 0;
         uint64_t wcwPendingRunSerial = 0;
         uint32_t wcwPendingRunAddr = 0;
+        uint32_t wcwPendingFrames = 0; // generated frames the pending run will make available
         // True once any layer of the current run has skipped its generated frame.
         bool wcwRunGenIncomplete = false;
         while (threadsRunning) {
@@ -1268,6 +1269,20 @@ namespace RT64 {
                         }
                     }
 
+                    // [wcw fix] All layers of a run use the rate of its first layer, so they agree on how many frames
+                    // to generate and at which weights. A later layer's estimate can read double (e.g. 60 instead of
+                    // 30); at a 120Hz target that gave it 2 frames while the rest of the run drew 4, leaving the extra
+                    // generated frames with only some of the run's layers.
+                    {
+                        static uint32_t wcwRunRate = 0;
+                        if (RT64::wcwInterpActive.load(std::memory_order_relaxed) && (wcwCompositeRunLength > 1) && (wcwRunRate > 0)) {
+                            workload.viOriginalRate = wcwRunRate;
+                        }
+                        else {
+                            wcwRunRate = workload.viOriginalRate;
+                        }
+                    }
+
                     const bool displayRateAboveOriginal = (workload.viOriginalRate > 0) && (workloadConfig.targetRate > workload.viOriginalRate);
                     // [wcw] DIAGNOSTIC: WCW_NO_INTERP=1 disables interpolated-frame generation, to
                     // test whether the black flicker frames are produced by the interpolation path.
@@ -1293,14 +1308,19 @@ namespace RT64 {
                     displayFrames = uint32_t((logicalTicks - displayTicks) / workload.viOriginalRate);
                     deltaTimeMs = 1.0f / float(workloadConfig.targetRate);
 
-                    // [wcw fix] Cap the display frames per game frame (2 for a 30Hz game at 60Hz): the tick
-                    // accounting can otherwise creep ahead and leave the present behind.
-                    if (displayFrames > 2) {
-                        displayTicks += workload.viOriginalRate * (displayFrames - 2);
-                        displayFrames = 2;
+                    // [wcw fix] Cap the display frames per game frame at N = display rate / game rate (2 for a 30Hz
+                    // game at 60Hz, 4 at 120Hz): the tick accounting can otherwise creep ahead and leave the present
+                    // behind. Fewer than N means this game frame's generated frames are incomplete.
+                    const uint32_t wcwFramesPerGameFrame = std::max(2u, (workloadConfig.targetRate + workload.viOriginalRate / 2) / workload.viOriginalRate);
+                    if (displayFrames > wcwFramesPerGameFrame) {
+                        displayTicks += workload.viOriginalRate * (displayFrames - wcwFramesPerGameFrame);
+                        displayFrames = wcwFramesPerGameFrame;
                     }
 
-                    if (displayFrames <= 1) {
+                    // At rates that aren't a multiple of the game rate (e.g. 144 Hz) game frames alternate between
+                    // floor and floor+1 frames; only fewer than floor is incomplete.
+                    const uint32_t wcwMinFramesPerGameFrame = std::max(2u, workloadConfig.targetRate / workload.viOriginalRate);
+                    if (displayFrames < wcwMinFramesPerGameFrame) {
                         wcwRunGenIncomplete = true;
                     }
 
@@ -1326,7 +1346,8 @@ namespace RT64 {
                 if (wcwInterpFlushPending && (useDifferentCounters || !generateInterpolatedFrames)) {
                     {
                         std::scoped_lock<std::mutex> managerLock(ext.sharedResources->interpolatedMutex);
-                        ext.sharedResources->interpolatedFrames[wcwInterpFlushIndex].available++;
+                        InterpolatedFrameCounters &wcwFlushCounters = ext.sharedResources->interpolatedFrames[wcwInterpFlushIndex];
+                        wcwFlushCounters.available = std::max(wcwFlushCounters.available, wcwPendingFrames);
                         RT64::wcwAddrSlotComplete[(wcwPendingRunAddr >> 10) & 3].store(wcwPendingRunSerial, std::memory_order_relaxed);
                         RT64::wcwSlotRealComplete[wcwPendingRunSerial % 3].store(wcwPendingRunSerial, std::memory_order_relaxed);
                     }
@@ -1456,7 +1477,11 @@ namespace RT64 {
                     if (generateInterpolatedFrames && (usingMSAA || (frame > 0))) {
                         {
                             std::scoped_lock<std::mutex> cursorLock(cursorMutex);
-                            skipWorkloadNow = ((frame + 1) < displayFrames) && (writeCursor != threadCursor);
+                            // [wcw fix] Multi-layer frames: the next layer is always queued already, so this would stop every
+                            // layer but the last after its first generated frame (harmless at 2 frames per game frame, but at
+                            // 4 the remaining generated frames got only the last layer). Layers finish all their frames.
+                            skipWorkloadNow = ((frame + 1) < displayFrames) && (writeCursor != threadCursor) &&
+                                !RT64::wcwInterpActive.load(std::memory_order_relaxed);
                         }
 
                         // [wcw fix] Only the run's last layer publishes the generated frame, so the present
@@ -1473,7 +1498,9 @@ namespace RT64 {
                             wcwFlushNow = (wcwCompositeRunLength >= wcwExpectedRunLen);
                         }
 
-                        const bool wcwDropNow = wcwFlushNow && wcwRunGenIncomplete;
+                        // A run where any layer skipped a generated frame publishes none of them: with more than one
+                        // generated frame per game frame, layers could otherwise disagree on which frames they drew.
+                        const bool wcwDropNow = wcwRunGenIncomplete;
                         if (wcwDropNow) {
                             wcwFlushNow = false;
                         }
@@ -1499,6 +1526,7 @@ namespace RT64 {
                             wcwInterpFlushIndex = ext.sharedResources->interpolatedFramesIndex;
                             wcwPendingRunSerial = workload.wcwRunSerial;
                             wcwPendingRunAddr = interpolationTargetKey.address;
+                            wcwPendingFrames = usingMSAA ? (frame + 1) : frame;
                         }
 
                         // Add the amount of display ticks that correspond to the remaining frames.

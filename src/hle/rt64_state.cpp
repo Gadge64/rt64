@@ -63,6 +63,13 @@ namespace RT64 {
         rdp = std::make_unique<RDP>(this);
 
         reset();
+
+        // Texture dumping without the developer UI (for building texture pack mappings).
+        if (const char *dumpDir = getenv("RT64_DUMP_TEXTURES")) {
+            dumpingTexturesDirectory = std::filesystem::u8path(dumpDir);
+            std::error_code ec;
+            std::filesystem::create_directories(dumpingTexturesDirectory, ec);
+        }
     }
 
     State::~State() { }

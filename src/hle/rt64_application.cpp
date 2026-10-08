@@ -771,4 +771,8 @@ namespace RT64 {
     void Application::setFullScreen(bool fullscreen) {
         appWindow->setFullScreen(fullscreen);
     }
+
+    void Application::setOutputResolution(uint32_t width, uint32_t height, uint32_t refreshRate) {
+        appWindow->setOutputResolution(width, height, refreshRate);
+    }
 };

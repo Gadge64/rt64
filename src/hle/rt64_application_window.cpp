@@ -41,6 +41,8 @@ namespace RT64 {
         if (windowHook != nullptr) {
             UnhookWindowsHookEx(windowHook);
         }
+
+        restoreDisplayMode();
 #   endif
     }
 
@@ -190,6 +192,10 @@ namespace RT64 {
             // Get in which monitor the window is
             HMONITOR hmonitor = MonitorFromWindow(windowHandle, MONITOR_DEFAULTTONEAREST);
 
+            // [wcw] Switch the monitor to the requested output resolution, if any. The monitor
+            // rect queried below then reflects the new mode.
+            changeDisplayMode(hmonitor);
+
             // Get info from that monitor
             MONITORINFOEX monitorInfo;
             monitorInfo.cbSize = sizeof(MONITORINFOEX);
@@ -206,6 +212,9 @@ namespace RT64 {
             }
         }
         else {
+            // [wcw] Put the desktop back to its own resolution before restoring the window.
+            restoreDisplayMode();
+
             // Set in window mode with the last saved position and size.
             LONG_PTR lStyle = GetWindowLongPtr(windowHandle, GWL_STYLE);
             lStyle = (lStyle | WS_VISIBLE | WS_OVERLAPPEDWINDOW) & ~WS_POPUP;
@@ -238,6 +247,122 @@ namespace RT64 {
         fullScreen = newFullScreen;
 #   endif
     }
+
+    void ApplicationWindow::setOutputResolution(uint32_t width, uint32_t height, uint32_t refreshRate) {
+        if ((width == outputWidth) && (height == outputHeight) && (refreshRate == outputRefreshRate)) {
+            return;
+        }
+
+        outputWidth = width;
+        outputHeight = height;
+        outputRefreshRate = refreshRate;
+#   ifdef _WIN32
+        if (fullScreen) {
+            // Re-enter fullscreen so the monitor is switched to (or back from) the new mode.
+            setFullScreen(false);
+            setFullScreen(true);
+        }
+        else {
+            applyWindowedOutputSize();
+        }
+#   endif
+    }
+
+#   ifdef _WIN32
+    bool ApplicationWindow::changeDisplayMode(HMONITOR monitor) {
+        const bool changeSize = (outputWidth != 0) && (outputHeight != 0);
+        if (!changeSize && (outputRefreshRate == 0)) {
+            return false;
+        }
+
+        MONITORINFOEXW monitorInfo = {};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        if (!GetMonitorInfoW(monitor, &monitorInfo)) {
+            return false;
+        }
+
+        DEVMODEW current = {};
+        current.dmSize = sizeof(current);
+        if (!EnumDisplaySettingsW(monitorInfo.szDevice, ENUM_CURRENT_SETTINGS, &current)) {
+            return false;
+        }
+
+        const uint32_t width = changeSize ? outputWidth : current.dmPelsWidth;
+        const uint32_t height = changeSize ? outputHeight : current.dmPelsHeight;
+        const uint32_t refreshRate = (outputRefreshRate != 0) ? outputRefreshRate : current.dmDisplayFrequency;
+        if ((current.dmPelsWidth == width) && (current.dmPelsHeight == height) && (current.dmDisplayFrequency == refreshRate)) {
+            return false;
+        }
+
+        // Ask for the requested (or current) refresh rate; if the monitor doesn't offer it at this
+        // size, let the driver pick. CDS_FULLSCREEN makes the change temporary: Windows reverts it
+        // when the process exits, even on a crash.
+        DEVMODEW mode = {};
+        mode.dmSize = sizeof(mode);
+        mode.dmPelsWidth = width;
+        mode.dmPelsHeight = height;
+        mode.dmDisplayFrequency = refreshRate;
+        mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+        LONG result = ChangeDisplaySettingsExW(monitorInfo.szDevice, &mode, nullptr, CDS_FULLSCREEN, nullptr);
+        if ((result != DISP_CHANGE_SUCCESSFUL) && changeSize) {
+            fprintf(stderr, "[wcw][displaymode] %ux%u @ %uHz not available; letting the driver pick the refresh rate\n", width, height, refreshRate);
+            mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+            result = ChangeDisplaySettingsExW(monitorInfo.szDevice, &mode, nullptr, CDS_FULLSCREEN, nullptr);
+        }
+
+        if (result != DISP_CHANGE_SUCCESSFUL) {
+            fprintf(stderr, "[wcw][displaymode] %ux%u @ %uHz not available on this monitor (result %ld); using the desktop mode\n", width, height, refreshRate, result);
+            return false;
+        }
+
+        DEVMODEW applied = {};
+        applied.dmSize = sizeof(applied);
+        EnumDisplaySettingsW(monitorInfo.szDevice, ENUM_CURRENT_SETTINGS, &applied);
+        fprintf(stderr, "[wcw][displaymode] switched to %ux%u @ %uHz\n", uint32_t(applied.dmPelsWidth), uint32_t(applied.dmPelsHeight), uint32_t(applied.dmDisplayFrequency));
+        wcscpy_s(displayModeDevice, monitorInfo.szDevice);
+        displayModeChanged = true;
+        return true;
+    }
+
+    void ApplicationWindow::restoreDisplayMode() {
+        if (!displayModeChanged) {
+            return;
+        }
+
+        ChangeDisplaySettingsExW(displayModeDevice, nullptr, nullptr, 0, nullptr);
+        displayModeChanged = false;
+        fprintf(stderr, "[wcw][displaymode] restored the desktop resolution\n");
+    }
+
+    void ApplicationWindow::applyWindowedOutputSize() {
+        if ((outputWidth == 0) || (outputHeight == 0)) {
+            return;
+        }
+
+        // Size the client area (what the game renders into) to the requested resolution,
+        // centred on the window's monitor. Skip it when it can't fit on screen.
+        RECT r = { 0, 0, LONG(outputWidth), LONG(outputHeight) };
+        const DWORD style = DWORD(GetWindowLongPtr(windowHandle, GWL_STYLE));
+        const DWORD exStyle = DWORD(GetWindowLongPtr(windowHandle, GWL_EXSTYLE));
+        AdjustWindowRectEx(&r, style, GetMenu(windowHandle) != nullptr, exStyle);
+        const LONG windowWidth = r.right - r.left;
+        const LONG windowHeight = r.bottom - r.top;
+
+        MONITORINFO monitorInfo = {};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        GetMonitorInfo(MonitorFromWindow(windowHandle, MONITOR_DEFAULTTONEAREST), &monitorInfo);
+        const RECT &work = monitorInfo.rcWork;
+        if ((windowWidth > (work.right - work.left)) || (windowHeight > (work.bottom - work.top))) {
+            fprintf(stderr, "[wcw][displaymode] %ux%u window does not fit on this screen; keeping the current size\n", outputWidth, outputHeight);
+            return;
+        }
+
+        ShowWindow(windowHandle, SW_RESTORE);
+        const LONG left = work.left + ((work.right - work.left) - windowWidth) / 2;
+        const LONG top = work.top + ((work.bottom - work.top) - windowHeight) / 2;
+        SetWindowPos(windowHandle, NULL, left, top, windowWidth, windowHeight, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+#   endif
 
     void ApplicationWindow::makeResizable() {
 #   ifdef _WIN32

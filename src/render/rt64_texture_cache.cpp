@@ -20,9 +20,17 @@
 
 #include "rt64_texture_cache.h"
 
+#include <algorithm>
+#include <cctype>
+
 #define ONLY_USE_LOW_MIP_CACHE 0
 
 namespace RT64 {
+    static std::string toLowerRice(std::string str) {
+        std::transform(str.begin(), str.end(), str.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+        return str;
+    }
+
     // ReplacementMap
     
     static const interop::float2 IdentityScale = { 1.0f, 1.0f };
@@ -59,6 +67,8 @@ namespace RT64 {
         replacementDirectories.clear();
         resolvedHashVersions.clear();
         fileSystemStreamResolvedPaths.clear();
+        fileSystemLegacyFiles.clear();
+        legacyResolvedCache.clear();
 
         usedTexturePoolSize = 0;
         cachedTexturePoolSize = 0;
@@ -1073,6 +1083,7 @@ namespace RT64 {
                     newTexture->tmem = copyWorker->device->createTexture(RenderTextureDesc::Texture1D(std::max(uint32_t(upload.bytesTMEM.size()), 1U), 1, newTexture->format));
                     newTexture->tmem->setName("Texture Cache TMEM #" + std::to_string(TMEMGlobalCounter++));
                     newTexture->bytesTMEM = upload.bytesTMEM;
+                    newTexture->legacyKeys = upload.legacyKeys;
                     newTexture->loadTile = upload.loadTile;
                     newTexture->tlut = upload.tlut;
                     newTexture->decodeTMEM = upload.decodeTMEM;
@@ -1112,7 +1123,7 @@ namespace RT64 {
                         beforeDecodeBarriers.emplace_back(dstTexture->texture.get(), RenderTextureLayout::GENERAL);
                     }
 
-                    addResolvedPaths(upload.hash, upload.width, upload.height, upload.tlut, upload.loadTile, upload.bytesTMEM, upload.decodeTMEM, resolvedPathQueueCopy);
+                    addResolvedPaths(upload.hash, upload.width, upload.height, upload.tlut, upload.loadTile, upload.bytesTMEM, upload.decodeTMEM, upload.legacyKeys, resolvedPathQueueCopy);
                 }
 
                 replacementMapAdditions.clear();
@@ -1258,7 +1269,7 @@ namespace RT64 {
         }
     }
 
-    void TextureCache::queueGPUUploadTMEM(uint64_t hash, uint64_t creationFrame, const uint8_t *bytes, int bytesCount, int width, int height, uint32_t tlut, const LoadTile &loadTile, bool decodeTMEM) {
+    void TextureCache::queueGPUUploadTMEM(uint64_t hash, uint64_t creationFrame, const uint8_t *bytes, int bytesCount, int width, int height, uint32_t tlut, const LoadTile &loadTile, bool decodeTMEM, const std::string &legacyKeys) {
         assert(!decodeTMEM || ((width > 0) && (height > 0)));
 
         TextureUpload newUpload;
@@ -1270,6 +1281,7 @@ namespace RT64 {
         newUpload.loadTile = loadTile;
         newUpload.bytesTMEM = (bytes != nullptr) ? std::vector<uint8_t>(bytes, bytes + bytesCount) : std::vector<uint8_t>();
         newUpload.decodeTMEM = decodeTMEM;
+        newUpload.legacyKeys = legacyKeys;
 
         {
             std::unique_lock queueLock(uploadQueueMutex);
@@ -1286,7 +1298,7 @@ namespace RT64 {
         });
     }
 
-    void TextureCache::addResolvedPaths(uint64_t hash, uint32_t width, uint32_t height, uint32_t tlut, const LoadTile &loadTile, const std::vector<uint8_t> &bytesTMEM, bool decodeTMEM, std::vector<ReplacementResolvedPath> &resolvedPaths, uint64_t exclusiveDbHash) {
+    void TextureCache::addResolvedPaths(uint64_t hash, uint32_t width, uint32_t height, uint32_t tlut, const LoadTile &loadTile, const std::vector<uint8_t> &bytesTMEM, bool decodeTMEM, const std::string &legacyKeys, std::vector<ReplacementResolvedPath> &resolvedPaths, uint64_t exclusiveDbHash) {
         uint64_t hashes[TMEMHasher::CurrentHashVersion + 1] = {};
         for (uint32_t v : textureMap.replacementMap.resolvedHashVersions) {
             if (decodeTMEM && v < TMEMHasher::CurrentHashVersion) {
@@ -1306,9 +1318,77 @@ namespace RT64 {
                 if (it != fsResolvedPaths.end()) {
                     // Stop searching for replacements as soon as we find one.
                     resolvedPaths.emplace_back(it->second);
+                    return;
+                }
+            }
+        }
+
+        // Not in any database: try files named by other plugins' hashes (Rice/GLideN64, Jabo).
+        if (legacyKeys.empty() || (exclusiveDbHash != 0)) {
+            return;
+        }
+
+        auto &legacyFiles = textureMap.replacementMap.fileSystemLegacyFiles;
+        auto &legacyCache = textureMap.replacementMap.legacyResolvedCache;
+        auto cacheIt = legacyCache.find(hash);
+        if (cacheIt == legacyCache.end()) {
+            std::optional<ReplacementResolvedPath> found;
+            std::vector<std::string> keys;
+            size_t keyStart = 0;
+            while (keyStart <= legacyKeys.size()) {
+                size_t keyEnd = legacyKeys.find('|', keyStart);
+                if (keyEnd == std::string::npos) {
+                    keyEnd = legacyKeys.size();
+                }
+
+                const std::string key = legacyKeys.substr(keyStart, keyEnd - keyStart);
+                if (!key.empty()) {
+                    keys.emplace_back(key);
+
+                    // Rice key without the palette CRC (some packs name CI textures that way).
+                    size_t separators = 0;
+                    for (size_t p = 0; p < key.size(); p++) {
+                        if ((key[p] == '#') && (++separators == 3)) {
+                            keys.emplace_back(key.substr(0, p));
+                            break;
+                        }
+                    }
+                }
+
+                keyStart = keyEnd + 1;
+            }
+
+            for (const std::string &key : keys) {
+                for (int32_t i = int32_t(legacyFiles.size()) - 1; (i >= 0) && !found.has_value(); i--) {
+                    auto fileIt = legacyFiles[i].find(key);
+                    if (fileIt != legacyFiles[i].end()) {
+                        ReplacementResolvedPath resolvedPath;
+                        resolvedPath.fileSystemIndex = uint32_t(i);
+                        resolvedPath.textureHash = hash;
+                        resolvedPath.relativePath = fileIt->second;
+                        resolvedPath.originalOperation = ReplacementOperation::Stream;
+                        resolvedPath.resolvedOperation = ReplacementOperation::Stream;
+                        resolvedPath.originalShift = ReplacementShift::None;
+                        resolvedPath.resolvedShift = ReplacementShift::None;
+                        found = resolvedPath;
+                    }
+                }
+
+                if (found.has_value()) {
                     break;
                 }
             }
+
+            cacheIt = legacyCache.emplace(hash, found).first;
+
+            static uint32_t legacyMatches = 0;
+            if (found.has_value() && (++legacyMatches <= 20)) {
+                fprintf(stderr, "[texpack] legacy match #%u %s -> %s\n", legacyMatches, legacyKeys.c_str(), found->relativePath.c_str());
+            }
+        }
+
+        if (cacheIt->second.has_value()) {
+            resolvedPaths.emplace_back(cacheIt->second.value());
         }
     }
 
@@ -1447,7 +1527,7 @@ namespace RT64 {
             for (size_t i = 0; i < textureMap.textures.size(); i++) {
                 if (textureMap.textures[i] != nullptr) {
                     Texture *texture = textureMap.textures[i];
-                    addResolvedPaths(textureMap.hashes[i], texture->width, texture->height, texture->tlut, texture->loadTile, texture->bytesTMEM, texture->decodeTMEM, resolvedPathQueue, exclusiveDbHash);
+                    addResolvedPaths(textureMap.hashes[i], texture->width, texture->height, texture->tlut, texture->loadTile, texture->bytesTMEM, texture->decodeTMEM, texture->legacyKeys, resolvedPathQueue, exclusiveDbHash);
                 }
             }
         }
@@ -1469,6 +1549,7 @@ namespace RT64 {
         std::vector<std::unordered_map<uint64_t, ReplacementResolvedPath>> fileSystemResolvedPaths;
         std::vector<uint32_t> fileSystemHashVersions;
         std::vector<std::unordered_set<std::string>> fileSystemStreamSets;
+        std::vector<std::unordered_map<std::string, std::string>> fileSystemLegacyFiles;
         for (const ReplacementDirectory &replacementDirectory : replacementDirectories) {
             if (std::filesystem::is_regular_file(replacementDirectory.dirOrZipPath)) {
                 std::unique_ptr<FileSystem> fileSystem = FileSystemZip::create(replacementDirectory.dirOrZipPath, replacementDirectory.zipBasePath);
@@ -1556,12 +1637,54 @@ namespace RT64 {
             textureMap.replacementMap.resolvedHashVersions.insert(textureMap.replacementMap.resolvedHashVersions.end(), knownHashVersions.begin(), knownHashVersions.end());
         }
 
+        // Index files named by other plugins' hashes: Rice/GLideN64 "<name>#crc#fmt#siz[#palcrc]_<suffix>.<ext>"
+        // and Jabo Direct3D8 "<32 hex digits>.<ext>". Packs may hold the same name in several folders with different
+        // images; like the plugins, the file loaded last wins, in case-insensitive path order (Windows listing order).
+        fileSystemLegacyFiles.resize(fileSystems.size());
+        for (size_t i = 0; i < fileSystems.size(); i++) {
+            std::vector<std::string> sortedPaths;
+            for (const std::string &relativePath : *fileSystems[i]) {
+                sortedPaths.emplace_back(relativePath);
+            }
+
+            std::sort(sortedPaths.begin(), sortedPaths.end(), [](const std::string &a, const std::string &b) {
+                return toLowerRice(FileSystem::toForwardSlashes(a)) < toLowerRice(FileSystem::toForwardSlashes(b));
+            });
+
+            for (const std::string &relativePath : sortedPaths) {
+                const std::filesystem::path relativePathFs = std::filesystem::u8path(relativePath);
+                if (!ReplacementDatabase::isExtensionKnown(toLowerRice(relativePathFs.extension().u8string()))) {
+                    continue;
+                }
+
+                const std::string fileName = relativePathFs.filename().u8string();
+                const std::string stem = relativePathFs.stem().u8string();
+                const size_t firstHash = fileName.find('#');
+                const size_t lastUnderscore = fileName.find_last_of('_');
+                if ((firstHash != std::string::npos) && (lastUnderscore != std::string::npos) && (lastUnderscore > firstHash)) {
+                    const std::string key = toLowerRice(fileName.substr(firstHash + 1, lastUnderscore - firstHash - 1));
+                    fileSystemLegacyFiles[i].insert_or_assign(key, FileSystem::toForwardSlashes(relativePath));
+                }
+                else if ((stem.size() == 32) && (stem.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos)) {
+                    fileSystemLegacyFiles[i].insert_or_assign(toLowerRice(stem), FileSystem::toForwardSlashes(relativePath));
+                }
+            }
+        }
+
+        for (size_t i = 0; i < fileSystemLegacyFiles.size(); i++) {
+            if (!fileSystemLegacyFiles[i].empty()) {
+                fprintf(stderr, "[texpack] pack %zu: %zu Rice/Jabo-named textures indexed\n", i, fileSystemLegacyFiles[i].size());
+            }
+        }
+
         // Store the file systems in the replacement map.
         uint32_t fileSystemCount = uint32_t(fileSystems.size());
         textureMap.replacementMap.fileSystems = std::move(fileSystems);
         textureMap.replacementMap.fileSystemResolvedPaths = std::move(fileSystemResolvedPaths);
         textureMap.replacementMap.fileSystemHashVersions = std::move(fileSystemHashVersions);
         textureMap.replacementMap.fileSystemStreamSets = std::move(fileSystemStreamSets);
+        textureMap.replacementMap.fileSystemLegacyFiles = std::move(fileSystemLegacyFiles);
+        textureMap.replacementMap.legacyResolvedCache.clear();
         textureMap.replacementMap.fileSystemStreamResolvedPaths.resize(fileSystemCount);
 
         // Queue all textures that must be preloaded to the stream queues.

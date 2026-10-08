@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include <atomic>
 #include <condition_variable>
 #include <filesystem>
@@ -44,6 +46,7 @@ namespace RT64 {
         LoadTile loadTile;
         std::vector<uint8_t> bytesTMEM;
         bool decodeTMEM;
+        std::string legacyKeys;
     };
 
     struct LowMipCacheTexture {
@@ -86,6 +89,11 @@ namespace RT64 {
         std::vector<uint32_t> fileSystemHashVersions;
         std::vector<std::unordered_set<std::string>> fileSystemStreamSets;
         std::vector<std::unordered_multimap<std::string, ReplacementResolvedPath>> fileSystemStreamResolvedPaths;
+        // Files named by other plugins' hashes, per file system: Rice/GLideN64 ("crc#fmt#siz[#palcrc]") and
+        // Jabo Direct3D8 (32 hex digits, MD5). Matched at runtime by the texture's legacy keys when its rt64
+        // hash isn't in a database. Results are cached per rt64 hash.
+        std::vector<std::unordered_map<std::string, std::string>> fileSystemLegacyFiles;
+        std::unordered_map<uint64_t, std::optional<ReplacementResolvedPath>> legacyResolvedCache;
         std::vector<ReplacementDirectory> replacementDirectories;
         uint64_t usedTexturePoolSize = 0;
         uint64_t cachedTexturePoolSize = 0;
@@ -233,9 +241,9 @@ namespace RT64 {
         TextureCache(RenderWorker *directWorker, RenderWorker *copyWorker, uint32_t threadCount, const ShaderLibrary *shaderLibrary);
         ~TextureCache();
         void uploadThreadLoop();
-        void queueGPUUploadTMEM(uint64_t hash, uint64_t creationFrame, const uint8_t *bytes, int bytesCount, int width, int height, uint32_t tlut, const LoadTile &loadTile, bool decodeTMEM);
+        void queueGPUUploadTMEM(uint64_t hash, uint64_t creationFrame, const uint8_t *bytes, int bytesCount, int width, int height, uint32_t tlut, const LoadTile &loadTile, bool decodeTMEM, const std::string &legacyKeys = std::string());
         void waitForGPUUploads();
-        void addResolvedPaths(uint64_t hash, uint32_t width, uint32_t height, uint32_t tlut, const LoadTile &loadTile, const std::vector<uint8_t> &bytesTMEM, bool decodeTMEM, std::vector<ReplacementResolvedPath> &resolvedPaths, uint64_t exclusiveDbHash = 0);
+        void addResolvedPaths(uint64_t hash, uint32_t width, uint32_t height, uint32_t tlut, const LoadTile &loadTile, const std::vector<uint8_t> &bytesTMEM, bool decodeTMEM, const std::string &legacyKeys, std::vector<ReplacementResolvedPath> &resolvedPaths, uint64_t exclusiveDbHash = 0);
         bool useTexture(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex, interop::float2 &textureScale, interop::float3 &textureDimensions, bool &textureReplaced, bool &hasMipmaps, bool &shiftedByHalf);
         bool useTexture(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex);
         bool addReplacement(uint64_t hash, const std::string &relativePath, ReplacementShift shift);

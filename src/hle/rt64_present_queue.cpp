@@ -393,6 +393,7 @@ namespace RT64 {
                     // rotating slot (serial % 3), once that run has finished.
                     if (wcwPairBlendSerial > 0) {
                         const uint32_t k = uint32_t(wcwPairBlendSerial % 3);
+                        colorTarget = nullptr;
                         if ((RT64::wcwSlotRealSerial[k].load(std::memory_order_relaxed) == wcwPairBlendSerial) &&
                             (RT64::wcwSlotRealComplete[k].load(std::memory_order_relaxed) == wcwPairBlendSerial)) {
                             auto &slotTargets = (k == 0) ? ext.sharedResources->interpolatedColorTargets
@@ -400,6 +401,12 @@ namespace RT64 {
                             if (targetIndex < slotTargets.size()) {
                                 colorTarget = slotTargets[targetIndex].get();
                             }
+                        }
+
+                        // The run's generated frames aren't (all) there: present nothing more for this game frame.
+                        if (colorTarget == nullptr) {
+                            framesToPresent = i;
+                            frameCountersNextPresented = frameCounters.count;
                         }
                     }
                 }
